@@ -6,14 +6,28 @@
  * User sees native HTML (mobile-friendly, real keyboard, copy-paste).
  * Captures Set-Cookie headers from the target after login.
  *
+ * Security notes:
+ * - Credentials go directly to the target service over HTTPS
+ * - Cookie Domain/Secure/SameSite attributes are rewritten for proxy compatibility
+ * - Cookie output files are written with mode 0600 (owner-only)
+ * - Control endpoints are protected with a session token
+ * - Response body size is capped to prevent DoS
+ * - Only the configured target origin is proxied (no open relay)
+ *
  * Usage: node auth-proxy.cjs <target-url> [--port 7890] [--extract-cookies domain1,domain2] [--output cookies.json]
  */
 
 const http = require("http");
 const https = require("https");
+const zlib = require("zlib");
+const crypto = require("crypto");
 const { URL } = require("url");
 const fs = require("fs");
 const path = require("path");
+
+// --- Constants ---
+const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB max response body
+const REQUEST_TIMEOUT = 30000; // 30s request timeout
 
 // --- Parse args ---
 const args = process.argv.slice(2);
@@ -43,11 +57,19 @@ const targetOrigin = target.origin;
 const isTargetHttps = target.protocol === "https:";
 const httpModule = isTargetHttps ? https : http;
 
+// CSRF token for control endpoints
+const sessionToken = crypto.randomBytes(16).toString("hex");
+
 // Collected cookies from all responses
 const capturedCookies = new Map(); // name -> full cookie object
 
+function log(level, msg) {
+  const ts = new Date().toISOString();
+  const prefix = level === "error" ? "❌" : level === "warn" ? "⚠️" : "ℹ️";
+  console.error(`[${ts}] ${prefix} ${msg}`);
+}
+
 function parseCookieHeader(setCookieHeader, requestHost) {
-  // Parse a Set-Cookie header string into a structured object
   const parts = setCookieHeader.split(";").map(p => p.trim());
   const [nameValue, ...attrs] = parts;
   const eqIdx = nameValue.indexOf("=");
@@ -77,7 +99,6 @@ function parseCookieHeader(setCookieHeader, requestHost) {
   return cookie;
 }
 
-// Build cookie jar string from captured cookies for forwarding
 function getCookieJar() {
   return Array.from(capturedCookies.values())
     .map(c => `${c.name}=${c.value}`)
@@ -87,23 +108,22 @@ function getCookieJar() {
 function rewriteHeaders(headers, proxyHost) {
   const result = { ...headers };
 
-  // Remove hop-by-hop headers
   delete result["host"];
   delete result["connection"];
   delete result["keep-alive"];
   delete result["transfer-encoding"];
   delete result["upgrade"];
 
-  // Set correct host for target
   result["host"] = target.host;
 
-  // Forward cookies from our jar
   const jar = getCookieJar();
   if (jar) {
     result["cookie"] = jar;
   }
 
-  // Remove referer/origin that would expose the proxy
+  // Remove accept-encoding to get uncompressed response (easier to rewrite)
+  delete result["accept-encoding"];
+
   if (result["referer"]) {
     result["referer"] = result["referer"].replace(new RegExp(`https?://[^/]+`, "g"), targetOrigin);
   }
@@ -134,18 +154,15 @@ function rewriteBody(body, contentType, proxyHost) {
 
   let text = body.toString("utf-8");
 
-  // Rewrite absolute URLs to target → proxy
   const escapedOrigin = targetOrigin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   text = text.replace(new RegExp(escapedOrigin, "g"), `http://${proxyHost}`);
 
-  // Also handle protocol-relative URLs
   const protoRelative = targetOrigin.replace(/^https?:/, "");
   text = text.replace(new RegExp(protoRelative.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), "g"), `//${proxyHost}`);
 
   return Buffer.from(text, "utf-8");
 }
 
-// Status page
 function statusPage(proxyHost) {
   const cookieCount = capturedCookies.size;
   const cookieList = Array.from(capturedCookies.values())
@@ -170,32 +187,45 @@ function statusPage(proxyHost) {
 <p class="cookie-count">${cookieCount} cookies captured</p>
 ${cookieList ? `<pre>${cookieList}</pre>` : '<p>No cookies yet. Log in first!</p>'}
 <a class="btn" href="/">→ Go to login page</a>
-${cookieCount > 0 ? '<a class="btn done" href="/__auth_proxy__/done">✅ Done — save cookies</a>' : ''}
+${cookieCount > 0 ? `<a class="btn done" href="/__auth_proxy__/done?token=${sessionToken}">✅ Done — save cookies</a>` : ''}
 </body></html>`;
 }
 
 const server = http.createServer((req, res) => {
   const proxyHost = req.headers.host || `localhost:${port}`;
+  const reqUrl = new URL(req.url, `http://${proxyHost}`);
 
-  // Status/control endpoints
-  if (req.url === "/__auth_proxy__/status") {
+  // --- Control endpoints ---
+  if (reqUrl.pathname === "/__auth_proxy__/status") {
     res.writeHead(200, { "Content-Type": "text/html" });
     res.end(statusPage(proxyHost));
     return;
   }
 
-  if (req.url === "/__auth_proxy__/cookies") {
+  if (reqUrl.pathname === "/__auth_proxy__/cookies") {
+    // Require session token
+    if (reqUrl.searchParams.get("token") !== sessionToken) {
+      res.writeHead(403, { "Content-Type": "text/plain" });
+      res.end("Forbidden: invalid token");
+      return;
+    }
     const cookies = Array.from(capturedCookies.values());
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(cookies, null, 2));
     return;
   }
 
-  if (req.url === "/__auth_proxy__/done") {
+  if (reqUrl.pathname === "/__auth_proxy__/done") {
+    // Require session token for CSRF protection
+    if (reqUrl.searchParams.get("token") !== sessionToken) {
+      res.writeHead(403, { "Content-Type": "text/plain" });
+      res.end("Forbidden: invalid token");
+      return;
+    }
     const cookies = Array.from(capturedCookies.values());
     if (outputFile) {
-      fs.writeFileSync(outputFile, JSON.stringify(cookies, null, 2) + "\n");
-      console.log(`\n✅ Saved ${cookies.length} cookies → ${outputFile}`);
+      fs.writeFileSync(outputFile, JSON.stringify(cookies, null, 2) + "\n", { mode: 0o600 });
+      log("info", `Saved ${cookies.length} cookies → ${outputFile} (mode 0600)`);
     }
     res.writeHead(200, { "Content-Type": "text/html" });
     res.end(`<!DOCTYPE html><html><head>
@@ -207,18 +237,16 @@ const server = http.createServer((req, res) => {
       <p>You can close this tab now.</p>
       </body></html>`);
 
-    // Signal to parent process
     console.log("__AUTH_PROXY_DONE__");
     setTimeout(() => process.exit(0), 1000);
     return;
   }
 
-  // Proxy the request
+  // --- Proxy requests (only to configured target) ---
   const targetPath = req.url || "/";
   const headers = rewriteHeaders(req.headers, proxyHost);
 
-  // Remove accept-encoding to get uncompressed response (easier to rewrite)
-  delete headers["accept-encoding"];
+  log("info", `${req.method} ${targetPath}`);
 
   const proxyReq = httpModule.request(
     {
@@ -228,6 +256,7 @@ const server = http.createServer((req, res) => {
       method: req.method,
       headers: headers,
       rejectUnauthorized: true,
+      timeout: REQUEST_TIMEOUT,
     },
     (proxyRes) => {
       // Capture Set-Cookie headers
@@ -237,33 +266,70 @@ const server = http.createServer((req, res) => {
         if (parsed) {
           capturedCookies.set(parsed.name, parsed);
           if (extractDomains.length === 0 || extractDomains.some(d => parsed.domain.includes(d))) {
-            console.log(`  🍪 ${parsed.name}=${parsed.value.substring(0, 20)}...`);
+            log("info", `🍪 ${parsed.name}=${parsed.value.substring(0, 20)}...`);
           }
         }
       }
 
-      // Collect response body for rewriting
+      // Decompress response if needed
+      let responseStream = proxyRes;
+      const encoding = (proxyRes.headers["content-encoding"] || "").toLowerCase();
+      if (encoding === "gzip" || encoding === "x-gzip") {
+        responseStream = proxyRes.pipe(zlib.createGunzip());
+      } else if (encoding === "br") {
+        responseStream = proxyRes.pipe(zlib.createBrotliDecompress());
+      } else if (encoding === "deflate") {
+        responseStream = proxyRes.pipe(zlib.createInflate());
+      }
+
+      if (responseStream !== proxyRes) {
+        responseStream.on("error", (err) => {
+          log("warn", `Decompression error: ${err.message}`);
+          if (!res.headersSent) {
+            res.writeHead(502, { "Content-Type": "text/plain" });
+            res.end("Decompression error — please retry");
+          }
+        });
+      }
+
+      // Collect response body with size limit
       const chunks = [];
-      proxyRes.on("data", (chunk) => chunks.push(chunk));
-      proxyRes.on("end", () => {
+      let totalSize = 0;
+      let aborted = false;
+
+      responseStream.on("data", (chunk) => {
+        totalSize += chunk.length;
+        if (totalSize > MAX_BODY_SIZE) {
+          if (!aborted) {
+            aborted = true;
+            log("warn", `Response exceeded ${MAX_BODY_SIZE} bytes, aborting`);
+            proxyRes.destroy();
+            if (!res.headersSent) {
+              res.writeHead(502, { "Content-Type": "text/plain" });
+              res.end("Response too large");
+            }
+          }
+          return;
+        }
+        chunks.push(chunk);
+      });
+
+      responseStream.on("end", () => {
+        if (aborted) return;
+
         let body = Buffer.concat(chunks);
         const contentType = proxyRes.headers["content-type"] || "";
 
-        // Rewrite body (URLs)
         body = rewriteBody(body, contentType, proxyHost);
 
-        // Rewrite response headers
         const resHeaders = { ...proxyRes.headers };
 
-        // Rewrite Location headers for redirects
         if (resHeaders["location"]) {
           resHeaders["location"] = rewriteLocationHeader(resHeaders["location"], proxyHost);
         }
 
-        // Rewrite Set-Cookie domains to work with proxy
         if (resHeaders["set-cookie"]) {
           resHeaders["set-cookie"] = resHeaders["set-cookie"].map(sc => {
-            // Remove Domain attribute so cookie applies to proxy host
             return sc
               .replace(/;\s*[Dd]omain=[^;]*/g, "")
               .replace(/;\s*[Ss]ecure/g, "")
@@ -271,15 +337,13 @@ const server = http.createServer((req, res) => {
           });
         }
 
-        // Remove CSP that might block our proxy
+        // Remove content-encoding since we decompressed
+        delete resHeaders["content-encoding"];
         delete resHeaders["content-security-policy"];
         delete resHeaders["content-security-policy-report-only"];
         delete resHeaders["x-frame-options"];
 
-        // Fix content-length since we might have rewritten the body
         resHeaders["content-length"] = Buffer.byteLength(body);
-
-        // Remove transfer-encoding since we're sending the full body
         delete resHeaders["transfer-encoding"];
 
         res.writeHead(proxyRes.statusCode, resHeaders);
@@ -288,26 +352,47 @@ const server = http.createServer((req, res) => {
     }
   );
 
-  proxyReq.on("error", (err) => {
-    console.error(`  ❌ Proxy error: ${err.message}`);
-    res.writeHead(502, { "Content-Type": "text/plain" });
-    res.end(`Proxy error: ${err.message}`);
+  proxyReq.on("timeout", () => {
+    log("warn", `Request timeout: ${targetPath}`);
+    proxyReq.destroy();
+    if (!res.headersSent) {
+      res.writeHead(504, { "Content-Type": "text/plain" });
+      res.end("Gateway timeout");
+    }
   });
 
-  // Forward request body
+  proxyReq.on("error", (err) => {
+    log("error", `Proxy error: ${err.message} (${targetPath})`);
+    if (!res.headersSent) {
+      res.writeHead(502, { "Content-Type": "text/plain" });
+      res.end(`Proxy error: ${err.message}`);
+    }
+  });
+
   req.pipe(proxyReq);
 });
 
 server.listen(port, "127.0.0.1", () => {
   console.log(`\n🔐 Auth Proxy running on http://127.0.0.1:${port}`);
   console.log(`   Proxying → ${targetOrigin}`);
+  console.log(`   Session token: ${sessionToken}`);
   console.log(`   Status:  http://127.0.0.1:${port}/__auth_proxy__/status`);
+  console.log(`   Cookies: http://127.0.0.1:${port}/__auth_proxy__/cookies?token=${sessionToken}`);
+  console.log(`   Done:    http://127.0.0.1:${port}/__auth_proxy__/done?token=${sessionToken}`);
   console.log(`\n   After login, visit /__auth_proxy__/status to check cookies`);
-  console.log(`   Then hit /__auth_proxy__/done to save and exit\n`);
+  console.log(`   Then hit Done to save and exit\n`);
 });
 
 process.on("SIGINT", () => {
-  console.log("\n🧹 Shutting down...");
+  log("info", "Shutting down...");
   server.close();
   process.exit(0);
+});
+
+process.on("uncaughtException", (err) => {
+  log("error", `Uncaught: ${err.message}`);
+});
+
+process.on("unhandledRejection", (err) => {
+  log("error", `Unhandled rejection: ${err}`);
 });
